@@ -521,6 +521,134 @@ There are a few parameters that can help you tune the memory usage and GC overhe
 
 ## **Important points to remember:**
 
+- A DStream is associated with a single receiver. For attaining read parallelism multiple receivers i.e. multiple DStreams need to be created. A receiver is run within an executor. It occupies one core. Ensure that there are enough cores for processing after re ceiver slots are booked i.e. `spark.cores.max` should take the receiver slots into account. The receivers are allocated to executors in a round robin fashion.
+- When data is received from a stream source, receiver creates blocks of data. A new block of data is generated every blockInterval milliseconds. N blocks of data are created during the batchInterval where N = batchInterval/blockInterval. These blocks are distributed by the BlockManager of the current executor to the block managers of other executors. After that, the Network Input Tracker running on the driver is informed about the block locations for further processing.
+- An RDD is created on the driver for the blocks created during the batchInterval. The blocks generated during the batchInterval are partitions of the RDD. Each partition is a task in spark. blockInterval== batchinterval would mean that a single partition is created and probably it is processed locally.
+- Instead of relying on batchInterval and blockInterval, you can define the number of partitions by calling `inputDstream.repartition(n)`. This reshuffles the data in RDD randomly to create n number of partitions. Yes, for greater parallelism. Though comes at the cost of a shuffle. An RDD’s processing is scheduled by driver’s jobscheduler as a job. At a given point of time only one job is active. So, if one job is executing the other jobs are queued.
+- If you have two dstreams there will be two RDDs formed and there will be two jobs created which will be scheduled one after the another. To avoid this, you can union two dstreams. This will ensure that a single unionRDD is formed for the two RDDs of the dstreams. This unionRDD is then considered as a single job. However, the partitioning of the RDDs is not impacted.
+- If the batch processing time is more than batchinterval then obviously the receiver’s memory will start filling up and will end up in throwing exceptions (most probably BlockNotFoundException). Currently, there is no way to pause the receiver. Using SparkConf configuration `spark.streaming.receiver.maxRate`, rate of receiver can be limited.
+
+- 하나의 receiver 가 하나의 DStream 을 처리하는 구조로 되어있고 하나의 CPU core 를 차지한다. 병렬성을 주고 싶다면 Multi Receiver 를 이용해야하며 여러개의 코어를 차지할 것이니 충분히 여유있게 코어를 Executor 에게 할당하자. Receiver 뿐만 아니라 실제로 처리하는 코어가 필요하니까.
+- Receiver 는 DStream 을 받을 때 데이터를 블록 단위로 만든다. 물론 블록마다 만드는데 걸리는 시간인 Block Interval 이 있다. Block Interval 은 milliseconds 단위로 이뤄진다. (이러한 블록들이 모여서 데이터 그룹을 나타내는 배치를 만드는 것 같다.) 현재 Exeucutor 에 있는 BlockManager 를 통해서 이렇게 만들어진 블록들은 다른 Executor 의 BlockManager 에게 전달된다. 이 과정후에 이 정보들은 Driver 에서 실행중인 Network Input Tracker 에게 전달된다. 추가적인 처리를 위해서.
+- RDD 는 외부 시스템 (하둡이나, S3) 같은 곳에서 만들어지거나 드라이버 프로세스에 의해서 만들어질 수 있다. RDD 를 이루는 파티션은 BatchInterval 동안 만들어진 블록들로 이뤄진다. (Executor 의 BlockManager 에 의해서 만들어진 블록들)
+- DStream.repartition(n) 을 통해서 RDD 의 데이터를 랜덤적으로 섞어서 n 개의 파티션을 만들 수 있다. 이 과정에서 셔플은 발생한다. RDD Processing 은 드라이버의 JobScheduler 를 통해서 처리가 되며 하나의 잡으로서 다뤄진다. 하나의 잡이 실행중인 동안에 다른 잡들은 큐에서 대기한다.
+- 두 개의 DStream 을 실행하면 두 개의 RDD 가 실행이되고 차례로 번갈아가면서 실행한다. 두 개의 DStream 을 하나로서 처리하고 싶다면 unionRDD 를 실행하면 된다.
+- 배치 처리시간이 batchInterval 시간보다 길다면 메모리가 가득차서 BlockNotFoundException 이 발생할 수 있다. 이 경우에는 `spark.streaming.receiver.maxRate` 로 Receiver 의 속도를 제어하자.
+
 ## **Fault-tolerance Semantics**
 
+In this section, we will discuss the behavior of Spark Streaming applications in the event of failures.
+
+### **Background**
+
+To understand the semantics provided by Spark Streaming, let us remember the basic fault-tolerance semantics of Spark’s RDDs.
+
+1. An RDD is an immutable, deterministically re-computable, distributed dataset. Each RDD remembers the lineage of deterministic operations that were used on a fault-tolerant input dataset to create it.
+2. If any partition of an RDD is lost due to a worker node failure, then that partition can be re-computed from the original fault-tolerant dataset using the lineage of operations.
+3. Assuming that all of the RDD transformations are deterministic, the data in the final transformed RDD will always be the same irrespective of failures in the Spark cluster.
+
+Spark operates on data in fault-tolerant file systems like HDFS or S3. Hence, all of the RDDs generated from the fault-tolerant data are also fault-tolerant. However, this is not the case for Spark Streaming as the data in most cases is received over the network (except when `fileStream` is used). To achieve the same fault-tolerance properties for all of the generated RDDs, the received data is replicated among multiple Spark executors in worker nodes in the cluster (default replication factor is 2). This leads to two kinds of data in the system that need to recovered in the event of failures:
+
+1. *Data received and replicated* - This data survives failure of a single worker node as a copy of it exists on one of the other nodes.
+2. *Data received but buffered for replication* - Since this is not replicated, the only way to recover this data is to get it again from the source.
+
+Furthermore, there are two kinds of failures that we should be concerned about:
+
+1. *Failure of a Worker Node* - Any of the worker nodes running executors can fail, and all in-memory data on those nodes will be lost. If any receivers were running on failed nodes, then their buffered data will be lost.
+2. *Failure of the Driver Node* - If the driver node running the Spark Streaming application fails, then obviously the SparkContext is lost, and all executors with their in-memory data are lost.
+
+With this basic knowledge, let us understand the fault-tolerance semantics of Spark Streaming.
+
+- RDD 의 특징은 Immutable, deterministically re-computable, distributed dataset 이라는 점이다. Immutable 하다는 건 transforming 만 가능하지 직접적으로 변경이 안된다는 뜻이며 deterministic 하다는 점은 실패가나도 재연산을 통해셔 결국에는 같은 최종 데이터를 얻을 수 있다는 점이다. distributed dataset 은 병렬적으로 처리가 가능함을 말한다.
+- determinisitic 의 특징은 fault-tolerant 한 저장소를 쓰고 있는 경우에는 당연하게 이 기능을 지원할 것이다. 하지만 Spark Streaming Application 의 경우에는 어떻게 이 기능을 지원받을 수 있을까? Receiver 가 데이터를 받으면 이걸 다른 Worker node 에 복제하기 때문에 가능하다. replication factor 는 기본적으로 2 이다.
+- Spark Streaming 에서 효율적인 복제를 위해서 Buffer 를 쓰는데 버퍼에 데이터가 있지만 아직 복제되지는 않은 경우에 실패가나면 데이터가 유실될 수 있다. 이 경우에는 어쩔 수 없이 한번 더 받아야한다.
+- 추가로 스파크에서는 두 종류의 실패가 있는데 이것도 알아보자. 워커노드가 실패한 경우에는 해당 워커노드의 버퍼에 있는 데이터만 잃어버릴 수 있지만 드라이버가 장애가 난 경우에는 모든 워커노드의 버퍼에 있는 데이터를 잃어버릴 수 있다.
+
+
+
+### **Definitions**
+
+The semantics of streaming systems are often captured in terms of how many times each record can be processed by the system. There are three types of guarantees that a system can provide under all possible operating conditions (despite failures, etc.)
+
+1. *At most once*: Each record will be either processed once or not processed at all.
+2. *At least once*: Each record will be processed one or more times. This is stronger than *at-most once* as it ensure that no data will be lost. But there may be duplicates.
+3. *Exactly once*: Each record will be processed exactly once - no data will be lost and no data will be processed multiple times. This is obviously the strongest guarantee of the three.
+- Streaming System 에서는 데이터를 몇번 처리하느냐에 따라서 구별될 수 있다.
+- 정확하게 한 번, 최소 한 번, 최대 한 번.
+
+### Basic Semantics
+
+In any stream processing system, broadly speaking, there are three steps in processing the data.
+
+1. *Receiving the data*: The data is received from sources using Receivers or otherwise.
+2. *Transforming the data*: The received data is transformed using DStream and RDD transformations.
+3. *Pushing out the data*: The final transformed data is pushed out to external systems like file systems, databases, dashboards, etc.
+
+If a streaming application has to achieve end-to-end exactly-once guarantees, then each step has to provide an exactly-once guarantee. That is, each record must be received exactly once, transformed exactly once, and pushed to downstream systems exactly once. Let’s understand the semantics of these steps in the context of Spark Streaming.
+
+1. *Receiving the data*: Different input sources provide different guarantees. This is discussed in detail in the next subsection.
+2. *Transforming the data*: All data that has been received will be processed *exactly once*, thanks to the guarantees that RDDs provide. Even if there are failures, as long as the received input data is accessible, the final transformed RDDs will always have the same contents.
+3. *Pushing out the data*: Output operations by default ensure *at-least once* semantics because it depends on the type of output operation (idempotent, or not) and the semantics of the downstream system (supports transactions or not). But users can implement their own transaction mechanisms to achieve *exactly-once* semantics. This is discussed in more details later in the section.
+- Steaming 처리를 간략하게 구성한다면 이럴 것이다.
+- 데이터를 가져와서 transforming 한 후 외부 시스템에 데이터를 pushing out 하는 것.
+- 여기서 정확하게 한 번 처리를 하기 위해서는 Receiving the data, Transforming the data, Pushing out the data 모두 한번만 해야한다.
+- Receiving Data 의 경우 어떤 Input Source 를 쓰는지에 따라서 다르다. 이는 뒤에서 하나씩 살펴보자.
+- Transforming Data 의 경우 RDD 를 사용하면 보장해준다.
+- Pushing out Data 의 경우 최소 한번은 일단 보장해준다. 데이터 전송은 여러번 할 수 있으니, 그치만 정확하게 한번만 보내기 위해서는 외부 시스템이 제공해주거나 제공해주지 않는다면 자체적인 트랜잭션 로직을 구현해야하거나 멱등성을 보장하도록 만들어야 할 수도 있다.
+
 ## **Semantics of Received Data**
+
+Different input sources provide different guarantees, ranging from *at-least once* to *exactly once*. Read for more details.
+
+### **With Files**
+
+If all of the input data is already present in a fault-tolerant file system like HDFS, Spark Streaming can always recover from any failure and process all of the data. This gives *exactly-once* semantics, meaning all of the data will be processed exactly once no matter what fails.
+
+### **With Receiver-based Sources**
+
+For input sources based on receivers, the fault-tolerance semantics depend on both the failure scenario and the type of receiver. As we discussed [earlier](https://spark.apache.org/docs/latest/streaming-programming-guide.html#receiver-reliability), there are two types of receivers:
+
+1. *Reliable Receiver* - These receivers acknowledge reliable sources only after ensuring that the received data has been replicated. If such a receiver fails, the source will not receive acknowledgment for the buffered (unreplicated) data. Therefore, if the receiver is restarted, the source will resend the data, and no data will be lost due to the failure.
+2. *Unreliable Receiver* - Such receivers do *not* send acknowledgment and therefore *can* lose data when they fail due to worker or driver failures.
+
+Depending on what type of receivers are used we achieve the following semantics. If a worker node fails, then there is no data loss with reliable receivers. With unreliable receivers, data received but not replicated can get lost. If the driver node fails, then besides these losses, all of the past data that was received and replicated in memory will be lost. This will affect the results of the stateful transformations.
+
+To avoid this loss of past received data, Spark 1.2 introduced *write ahead logs* which save the received data to fault-tolerant storage. With the [write-ahead logs enabled](https://spark.apache.org/docs/latest/streaming-programming-guide.html#deploying-applications) and reliable receivers, there is zero data loss. In terms of semantics, it provides an at-least once guarantee.
+
+The following table summarizes the semantics under failures:
+
+[Summarize](https://www.notion.so/4845fc0237cf4fd0a585e90ee1be8b41)
+
+### **With Kafka Direct API**
+
+In Spark 1.3, we have introduced a new Kafka Direct API, which can ensure that all the Kafka data is received by Spark Streaming exactly once. Along with this, if you implement exactly-once output operation, you can achieve end-to-end exactly-once guarantees. This approach is further discussed in the [Kafka Integration Guide](https://spark.apache.org/docs/latest/streaming-kafka-0-10-integration.html).
+
+- Input Source 를 File 로 이용하는 경우, 하둡과 같은 것들을 이용하는 경우에는 data loss 가 없고 한번만 딱 가지고 오는게 가능하다.
+- 하지만 Input Source 를 Receiver 를 통해서 가지고 오는 경우에는 Receiver 의 종류를 고려해야한다. 데이터를 한번만 가지고 오는건 별로 문제가 되지 않을 것이다. (최대 한 번 처리)
+- Receiver 는 Reliable Receiver, Unreliable Receiver 가 있는데 일반적으로 데이터를 읽어버릴 확률이 크 다.
+- 이를 위해 spark 1.2 부터 들어온 write-ahead log 때문에 zero data loss 가 가능해졌다.
+- 카프카를 Receiver 로 쓰는 경우에는 스파크 1.3 부터 안전하게 정확하게 한 번 가지고 오는게 가능하다.
+
+## Semantics of output operations
+
+Output operations (like `foreachRDD`) have *at-least once* semantics, that is, the transformed data may get written to an external entity more than once in the event of a worker failure. While this is acceptable for saving to file systems using the `saveAs***Files` operations (as the file will simply get overwritten with the same data), additional effort may be necessary to achieve exactly-once semantics. There are two approaches.
+
+- *Idempotent updates*: Multiple attempts always write the same data. For example, `saveAs***Files` always writes the same data to the generated files.
+- *Transactional updates*: All updates are made transactionally so that updates are made exactly once atomically. One way to do this would be the following.
+    - Use the batch time (available in `foreachRDD`) and the partition index of the RDD to create an identifier. This identifier uniquely identifies a blob data in the streaming application.
+    - Update external system with this blob transactionally (that is, exactly once, atomically) using the identifier. That is, if the identifier is not already committed, commit the partition data and the identifier atomically. Else, if this was already committed, skip the update.
+
+```scala
+dstream.foreachRDD { (rdd, time) =>
+  rdd.foreachPartition { partitionIterator =>
+    val partitionId = TaskContext.get.partitionId()
+    val uniqueId = generateUniqueId(time.milliseconds, partitionId)
+    // use this uniqueId to transactionally commit the data in partitionIterator
+  }
+}
+```
+
+- Pushing out Data 의 경우는 최소 한 번 보장일 것이다. 다시 시작하는 경우가 있을수도 있고, 동시성 문제가 생길수도 있으니.
+- 일반적인 파일로 저장하는 `saveAsXXXFiles` 의 오퍼레이션은 파일을 overwrtting 한다. 그러므로 동시성 문제가 생겼을 때 문제가 될 수 있으니 멱등성을 보장하도록 설계하거나 트랜잭션을 보장하도록 해야한다.
+    - spark streaming 에서 트랜잭션을 보장하려면 RDD Partition index 를 이용해서 유니크한 ID 를 만어서 이용하면 된다. 현재 데이터가 커밋되어있지 않다면 커밋하고, 커밋되어 있으면 스킵하고 그런 식으로 결국 최종 RDD 는 변하지 않을 것이니 이를 이용하면 된다.
+
