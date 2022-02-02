@@ -493,7 +493,121 @@ To run a Spark Streaming applications, you need to have the following.
 
 ## **Monitoring Applications**
 
+Beyond Spark’s [monitoring capabilities](https://spark.apache.org/docs/latest/monitoring.html), there are additional capabilities specific to Spark Streaming. When a StreamingContext is used, the [Spark web UI](https://spark.apache.org/docs/latest/monitoring.html#web-interfaces) shows an additional `Streaming` tab which shows statistics about running receivers (whether receivers are active, number of records received, receiver error, etc.) and completed batches (batch processing times, queueing delays, etc.). This can be used to monitor the progress of the streaming application.
+
+The following two metrics in web UI are particularly important:
+
+- *Processing Time* - The time to process each batch of data.
+- *Scheduling Delay* - the time a batch waits in a queue for the processing of previous batches to finish.
+
+If the batch processing time is consistently more than the batch interval and/or the queueing delay keeps increasing, then it indicates that the system is not able to process the batches as fast they are being generated and is falling behind. In that case, consider [reducing](https://spark.apache.org/docs/latest/streaming-programming-guide.html#reducing-the-batch-processing-times) the batch processing time.
+
+The progress of a Spark Streaming program can also be monitored using the [StreamingListener](https://spark.apache.org/docs/latest/api/scala/org/apache/spark/streaming/scheduler/StreamingListener.html) interface, which allows you to get receiver status and processing times. Note that th
+
+- Spark Web UI 에서 유용한 정보를 제공해준다. 그 중 중요한건 다음과 같다.
+  - Processing Time: 실제 배치를 처리하는데 걸리는 시간
+  - Scheduling Delay: 배치가 처리되지 않고 큐에서 대기한 시간
+- Processing Time 이 Scheduleing Delay 보다 작아야 어플리케이션은 안정하다. (물론 일시적으로 Processing Time 이 더 클수도 있다.) 
+- Delay 가 계속해서 커지고 있다면 어플리케이션의 문제가 있다고 판단하면 된다. 
+
+
 ## **Performance Tuning**
+
+Getting the best performance out of a Spark Streaming application on a cluster requires a bit of tuning. This section explains a number of the parameters and configurations that can be tuned to improve the performance of you application. At a high level, you need to consider two things:
+
+1. Reducing the processing time of each batch of data by efficiently using cluster resources.
+
+2. Setting the right batch size such that the batches of data can be processed as fast as they are received (that is, data processing keeps up with the data ingestion).
+
+- 스파크 어플리케이션에서 최적의 속도를 내기 위해서는 어느정도 튜닝이 필요하다.  
+- 튜닝 요소는 크게 두 가지가 있다.
+  - 클러스터의 리소스를 효율적으로 사용해서 각각의 배치 처리 시간을 줄이는 것.
+  - 올바른 배치 사이즈를 결정하는 것. (배치 처리 시간 > 배치 수집 시간) 
+  - 즉 배치 처리 시간을 배치 수집 시간보다 줄여야 한다는 것을 의미한다.
+
+## Reducing the Batch Processing Times
+
+There are a number of optimizations that can be done in Spark to minimize the processing time of each batch. These have been discussed in detail in the Tuning Guide. This section highlights some of the most important ones.
+
+### Level of Parallelism in Data Receiving
+
+Receiving data over the network (like Kafka, socket, etc.) requires the data to be deserialized and stored in Spark. If the data receiving becomes a bottleneck in the system, then consider parallelizing the data receiving. Note that each input DStream creates a single receiver (running on a worker machine) that receives a single stream of data. Receiving multiple data streams can therefore be achieved by creating multiple input DStreams and configuring them to receive different partitions of the data stream from the source(s). For example, a single Kafka input DStream receiving two topics of data can be split into two Kafka input streams, each receiving only one topic. This would run two receivers, allowing data to be received in parallel, thus increasing overall throughput. These multiple DStreams can be unioned together to create a single DStream. Then the transformations that were being applied on a single input DStream can be applied on the unified stream. This is done as follows.
+
+```scala
+val numStreams = 5
+val kafkaStreams = (1 to numStreams).map { i => KafkaUtils.createStream(...) }
+val unifiedStream = streamingContext.union(kafkaStreams)
+unifiedStream.print()
+```
+Another parameter that should be considered is the receiver’s block interval, which is determined by the configuration parameter spark.streaming.blockInterval. For most receivers, the received data is coalesced together into blocks of data before storing inside Spark’s memory. The number of blocks in each batch determines the number of tasks that will be used to process the received data in a map-like transformation. The number of tasks per receiver per batch will be approximately (batch interval / block interval). For example, block interval of 200 ms will create 10 tasks per 2 second batches. If the number of tasks is too low (that is, less than the number of cores per machine), then it will be inefficient as all available cores will not be used to process the data. To increase the number of tasks for a given batch interval, reduce the block interval. However, the recommended minimum value of block interval is about 50 ms, below which the task launching overheads may be a problem.
+
+An alternative to receiving data with multiple input streams / receivers is to explicitly repartition the input data stream (using inputStream.repartition(<number of partitions>)). This distributes the received batches of data across the specified number of machines in the cluster before further processing.
+
+For direct stream, please refer to Spark Streaming + Kafka Integration Guide
+
+
+- 여기서는 데이터를 처리하는 각 배치시간을 줄이는 방법에 대해서 살펴보겠다.
+- 데이터를 네트워크를 통해서 받아서 Deserialize 후 Spark Memory 에 올리는 작업을 하는 Receiver 가 배치 시간에 병목점이 될 수 있다.
+- 일반적으로 하나의 Input DStream 에는 기본적으로 하나의 Receiver 가 붙는다. 하둡과 같은 DataSource 를 사용하지 않는 경우에. 
+- 하지만 카프카같은 경우는 하나의 DStream 에서 여러가지 토픽을 구독해서 생성할 수 있는데 이 경우는 Receiver 를 하나를 쓰는 것이다. 토픽별로 DStream 을 구별해서 만든다면 여러개의 Receiver 를 쓰니까 전반적인 처리량이 올리갈 수 있다.
+- 그리고 반대로 Unified DStream 을 이용하면 여러개의 DStream 을 하나의 DStream 으로 합칠수도 있다.
+- `spark.streaming.blockinterval` 설정을 통해서 블록을 만드는 시간을 줄일 수 있다. 배치시간은 StreamingContext 를 만들 때 정해지고 이 배치시간동안에 블록을 만드는데 이렇게 만들어진 블록의 개수를 통해서 Task 의 개수가 정해진다. 
+- 즉 블록을 많이 만들면 Task 를 많이 만들고 이를 통해서 병렬적으로 많이 처리할 수 있다. Task 의 계산은 (BatchInterval/BlockInterval) 로 정해진다.
+- BlockInterval 의 minimum 은 50ms 로 이보다 줄이는걸 권장하지 않는다.
+- 또 병렬성을 늘리기 위해서는 repartition 을 통해서 주어진 Task 를 늘리는 식으로도 가능하다. 
+
+### Level of Parallelism in Data Processing
+
+Cluster resources can be under-utilized if the number of parallel tasks used in any stage of the computation is not high enough. For example, for distributed reduce operations like reduceByKey and reduceByKeyAndWindow, the default number of parallel tasks is controlled by the spark.default.parallelism configuration property. You can pass the level of parallelism as an argument (see PairDStreamFunctions documentation), or set the spark.default.parallelism configuration property to change the default.
+
+- Parallel Task 의 수가 충분하지 않는다면 클러스터의 리소스를 효율적으로 사용할 수 없다.
+- 예로 reduceByKey 나 reduceByKeyAndWindow 와 같은 연산을 하면 `spark.default.parallelism` 의 값으로 병렬 테스크를 제어한다. 이 값을 바꾸거나 PariDStreamFunctions 를 쓰는 것으로 병렬화 수준을 제어할 수 있다.
+
+### Data Serialization
+
+The overheads of data serialization can be reduced by tuning the serialization formats. In the case of streaming, there are two types of data that are being serialized.
+
+- **Input data:** By default, the input data received through Receivers is stored in the executors’ memory with StorageLevel.MEMORY_AND_DISK_SER_2. That is, the data is serialized into bytes to reduce GC overheads, and replicated for tolerating executor failures. Also, the data is kept first in memory, and spilled over to disk only if the memory is insufficient to hold all of the input data necessary for the streaming computation. This serialization obviously has overheads – the receiver must deserialize the received data and re-serialize it using Spark’s serialization format.
+
+- **Persisted RDDs generated by Streaming Operations:** RDDs generated by streaming computations may be persisted in memory. For example, window operations persist data in memory as they would be processed multiple times. However, unlike the Spark Core default of StorageLevel.MEMORY_ONLY, persisted RDDs generated by streaming computations are persisted with StorageLevel.MEMORY_ONLY_SER (i.e. serialized) by default to minimize GC overheads.
+
+In both cases, using Kryo serialization can reduce both CPU and memory overheads. See the Spark Tuning Guide for more details. For Kryo, consider registering custom classes, and disabling object reference tracking (see Kryo-related configurations in the Configuration Guide).
+
+In specific cases where the amount of data that needs to be retained for the streaming application is not large, it may be feasible to persist data (both types) as deserialized objects without incurring excessive GC overheads. For example, if you are using batch intervals of a few seconds and no window operations, then you can try disabling serialization in persisted data by explicitly setting the storage level accordingly. This would reduce the CPU overheads due to serialization, potentially improving performance without too much GC overheads.
+
+- Spark Streaming 에서 데이터 직렬화를 하는 경우는 크게 두 가지가 있다. 
+- Receiver 가 데이터를 받아서 메모리에 올리는 경우. (default: StorageLevel.MEMORY_AND_DISK_SER_2)
+- Streaming opeartion 을 거친 RDD 를 persist 하는 경우. (default: StorageLevel.MEMORY_ONLY_SEC)
+- 일반적으로 직렬화를 하면 역직렬화도 해야하므로 CPU 를 더 많이 쓴다는 단점이 있다. 그리고 직렬화를 한 객체보다 하기 전 객체가 더 접근이 빠르다. 하지만 직렬화를 하면 메모리를 최소 2~5 배 효율적으로 사용이 가능하다. 
+- 메모리를 효율적으로 쓸 수 있다는 말은 그만큼 GC 를 줄일 수 있다는 뜻이다. 만약에 데이터가 큰 메모리가 필요 없는 경우에는 그냥 직렬화를 쓰지 않고 저장하는게 더 나을 수 있다. 
+- 그 예 중 하나로 배치 시간이 초 단위로 이뤄져있고 window 오퍼레이션이 아니고 (기억해야 할 데이터가 적다는 뜻) 처리하는 데이터의 메모리가 작은 경우라면 직렬화를 쓰지 않는게 더 나을 수 있다.  
+- 직렬화를 쓴다면 그리고 무조건 Kryo 를 쓰자. 이게 10배 정도의 더 효과가 있다.
+
+### Task Launching Overheads
+
+
+If the number of tasks launched per second is high (say, 50 or more per second), then the overhead of sending out tasks to the executors may be significant and will make it hard to achieve sub-second latencies. The overhead can be reduced by the following changes:
+
+- Execution mode: Running Spark in Standalone mode or coarse-grained Mesos mode leads to better task launch times than the fine-grained Mesos mode. Please refer to the Running on Mesos guide for more details.
+
+These changes may reduce batch processing time by 100s of milliseconds, thus allowing sub-second batch size to be viable.
+
+- 초당 실행하는 테스크가 많다면 이 테스크를 Executor 에게 전송하는 비용도 꽤 크다. 이 경우에는 Execution mode 를 변경하면 줄일 수 있다.
+- Spark 를 Standalone 이나 coarse-grained Mesos mode 로 변경하자. 
+
+### Setting the Right Batch Interval
+
+For a Spark Streaming application running on a cluster to be stable, the system should be able to process data as fast as it is being received. In other words, batches of data should be processed as fast as they are being generated. Whether this is true for an application can be found by monitoring the processing times in the streaming web UI, where the batch processing time should be less than the batch interval.
+
+Depending on the nature of the streaming computation, the batch interval used may have significant impact on the data rates that can be sustained by the application on a fixed set of cluster resources. For example, let us consider the earlier WordCountNetwork example. For a particular data rate, the system may be able to keep up with reporting word counts every 2 seconds (i.e., batch interval of 2 seconds), but not every 500 milliseconds. So the batch interval needs to be set such that the expected data rate in production can be sustained.
+
+A good approach to figure out the right batch size for your application is to test it with a conservative batch interval (say, 5-10 seconds) and a low data rate. To verify whether the system is able to keep up with the data rate, you can check the value of the end-to-end delay experienced by each processed batch (either look for “Total delay” in Spark driver log4j logs, or use the StreamingListener interface). If the delay is maintained to be comparable to the batch size, then system is stable. Otherwise, if the delay is continuously increasing, it means that the system is unable to keep up and it therefore unstable. Once you have an idea of a stable configuration, you can try increasing the data rate and/or reducing the batch size. Note that a momentary increase in the delay due to temporary data rate increases may be fine as long as the delay reduces back to a low value (i.e., less than batch size).
+
+- Spark Streaming Application 이 안전하게 돌아가기 위해서는 Batch Interval 안에서 데이터 처리가 완료되어야 한다. 그래서 Delay 가 생겨선 안된다. 
+- Delay 가 생긴다는 의미는 Receiver 가 계속해서 데이터를 메모리에 적재하고 있다는 뜻으로 메모리가 가득차게 될 위험이 있다는 뜻이다.
+- 이 경우에는 Batch Processing 타임을 줄이도록 노력해보고 Batch Size 를 줄이도록 해봐야한다. (Block Interval 을 늘리면 될 것 같다.)
+- Batch Interval 을 정할때는 보수적으로 테스트를 해보면서 정하면 될 것 같고 어플리케이션이 안정한지 확인해보려면 Spark Driver 프로세서가 남기는 log4j.log 에서 Total Delay 를 보도록 하자. 아니면 StreamingListener Interface 를 사용해보자.
+- 딜레이가 점점 증가하는 형태라면 문제가 있다는 뜻이다.
 
 ## **Setting the Right Batch Interval**
 
