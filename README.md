@@ -4,7 +4,9 @@ Apache Spark 을 공부하고 정리한 레파지토리 입니다.
 
 ## [목차]
 
-- [Spark Introduction](documents/)
+- [Spark Introduction](documents/introduction.md)
+
+- [Partition](documents/spark_partition.md)
 
 - [Apache Spark Overview](documents/overview.md)
 
@@ -21,4 +23,5 @@ Apache Spark 을 공부하고 정리한 레파지토리 입니다.
 - [Structured Streaming Basic](documents/structured_streaming_basic.md)
 
 - [Spark Streaming Guide](documents/spark_streaming_guide.md)
+
 
