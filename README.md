@@ -10,6 +10,8 @@ Apache Spark 을 공부하고 정리한 레파지토리 입니다.
 
 - [Apache Spark Overview](documents/overview.md)
 
+- [Checkpoint](documents/checkpoint.md)
+
 - [RDD Basic](documents/rdd_basic.md)
 
 - [RDD Advance](documents/rdd_advance.md)
