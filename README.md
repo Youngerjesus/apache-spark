@@ -26,4 +26,6 @@ Apache Spark 을 공부하고 정리한 레파지토리 입니다.
 
 - [Spark Streaming Guide](documents/spark_streaming_guide.md)
 
+- [Spark Streaming + Kafka Integartion Guide (Kafka broker version 0.10.0 or higher)](documents/spark_streaming_and_kafka_integartion_guide_0.10.0_or_higher.md)
+
 
